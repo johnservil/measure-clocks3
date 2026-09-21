@@ -2,6 +2,10 @@
 
 ## Summary
 
+Status: an anomaly observed once and recorded, a proposed mechanism
+tested and ruled out, the trigger still open. The practical
+recommendation stands on the observation alone.
+
 `CLOCK_THREAD_CPUTIME_ID` looks like the ideal benchmark clock: it counts
 only the time the measured thread ran, so a preemption mid-sample leaves
 no trace. The main table in this repository shows that on an Apple M4
@@ -15,13 +19,15 @@ CPU clock produced a result the hardware cannot have delivered: all three
 implementations shared one minimum, 12% below their own steady medians.
 The same benchmark under the hardware counter showed no such floor.
 
-The cause is what the two kinds of clock *are*. A wall clock is a counter
-read. Thread CPU time is scheduler accounting: a ledger the kernel updates
-at context switches, with the running slice interpolated. A counter can
-only over-count when the thread is interrupted, and a median absorbs that
-while a min–max band reports it. A ledger can under-bill a slice, and then
-the sample reports the work finishing faster than it did. For a benchmark
-that is the worse failure: an impossibly fast minimum looks like a result.
+The two kinds of clock differ in what they *are*. A wall clock is a
+counter read. Thread CPU time is scheduler accounting: a ledger the
+kernel updates at context switches, with the running slice interpolated.
+A counter can only over-count when the thread is interrupted, and a
+median absorbs that while a min–max band reports it. A ledger can in
+principle under-bill a slice, and then the sample reports the work
+finishing faster than it did. For a benchmark that is the worse
+failure: an impossibly fast minimum looks like a result. The
+observation below is such a minimum; what produced it is not yet known.
 
 **For benchmarks, read a hardware counter.** On Darwin that is
 `CLOCK_UPTIME_RAW` (`mach_absolute_time` in nanoseconds), on Linux
@@ -59,38 +65,34 @@ once, at the same sizes — different code, different libraries, one
 floor. And the hardware counter's minima stay within 4% of the median.
 The 12% is an artifact of the clock, not of the hashing.
 
-## The mechanism, from XNU
+## What is known about the mechanism
 
-On Apple silicon, thread CPU time comes from `osfmk/kern/recount.c`.
-Three details matter.
+Thread CPU time on Apple silicon comes from `osfmk/kern/recount.c`. A
+thread's time is kept per CPU kind (`RCT_TOPO_CPU_KIND`: one track for
+performance cores, one for efficiency cores) and reconciled at each
+context switch by `recount_switch_thread`, which diffs the processor's
+last snapshot against the current one. A read of the clock sums the
+tracks and adds the running slice, timestamped with
+`ml_get_speculative_timebase()`, a timebase read without the ISB barrier
+that `mach_absolute_time` applies.
 
-Time is tracked per CPU kind. `recount_thread_plan` uses
-`RCT_TOPO_CPU_KIND`: a thread has one track for performance cores and
-one for efficiency cores, and its CPU time is the sum. A thread's ledger
-is updated when it switches off a processor (`recount_switch_thread`),
-which diffs the processor's last snapshot against the current one and
-absorbs the slice into the thread's track for that processor's kind.
+That structure makes under-billing *possible* in principle, and the
+first hypothesis was that migration between cores mid-sample was the
+trigger. The `--pitfall` test below was built to provoke exactly that,
+and on the M4 Max it did not: under contention heavy enough to preempt
+19% of samples, the thread clock under-billed one sample in ten
+thousand, by 3.7%. Preemption and migration under load are accounted
+correctly.
 
-The current slice is interpolated. `recount_current_thread_usage`
-takes a fresh snapshot, sums the thread's tracks, and adds the diff
-between the snapshot and the processor's last recorded one. The
-timestamp comes from `ml_get_speculative_timebase()`: a timebase read
-without the ISB barrier that `mach_absolute_time` applies. The comment
-in the source names it speculative.
+So the trigger in the bench-hashes run is something else, and it is
+still open. Two facts about that run narrow it: the floor appeared
+only at 16 KiB through 128 KiB, with smaller and larger inputs clean;
+and the process was running six hash implementations interleaved,
+including two that dispatch into system libraries. What differs about
+those sizes or that mix has not been identified.
 
-Migration splits a slice. When the scheduler moves the thread between a
-P-core and an E-core during a sample, two `recount_switch_thread` calls
-absorb two partial slices into two different tracks, reconciled from
-two processors' last snapshots.
-
-A sample that straddles a migration is therefore assembled from three
-pieces read on two cores against per-processor baselines, with the
-running piece from an unbarriered read. That is where a slice can come
-up short. The hardware counter reads one register once at each end.
-
-Linux tracks thread runtime as a single accumulator updated from one
-clock; its `CLOCK_THREAD_CPUTIME_ID` did not show this behaviour under
-test (below).
+Linux tracks thread runtime as a single accumulator from one clock; its
+`CLOCK_THREAD_CPUTIME_ID` showed no under-billing under the same test.
 
 ## Demonstrating it: `--pitfall`
 
@@ -122,14 +124,31 @@ finish.
 
 ### Results so far
 
-**Linux, 2-vCPU AArch64 VM (Apple M4 Max host), kernel 6.18**: no
-under-billed samples in 9,000, with 25% of samples preempted. Both
-clocks' floors at 88% of median (the workload's own variation). Linux's
-thread clock is honest here.
+**Linux, 2-vCPU AArch64 VM (Apple M4 Max host), kernel 6.18**, 9,000
+samples, 25% preempted: zero under-billed. Both floors at 88% of median
+(the workload's own variation in the VM).
 
-**macOS, Apple M4 Max**: the anomaly above was observed in bench-hashes.
-The `--pitfall` mode has not yet been run on this machine; its output
-belongs here.
+**macOS, Apple M4 Max**, 10,000 samples, 19% preempted, 33,929
+involuntary context switches: one under-billed sample (cpu/wall 963‰).
+Wall floor 998‰ of median, CPU floor 997‰. The test does not reproduce
+the bench-hashes anomaly on this machine.
+
+```
+                 clock          min       perc50       perc95          max   min/perc50
+   wall (hardware ctr)    1,027,000    1,029,042    1,802,958   17,528,042          99%
+       thread CPU time    1,027,166    1,029,250    1,673,917    1,777,292          99%
+
+    8,131  uninterrupted
+    1,868  descheduled
+        1  UNDER-BILLED (963‰)
+        0  cpu > wall
+```
+
+The anomaly is therefore real (it is in a saved result file, with the
+control run twenty minutes earlier showing none of it) and its trigger
+is unknown. The next step is to reproduce it in bench-hashes itself
+with both clocks recorded per sample, so the offending samples can be
+inspected rather than inferred.
 
 ## What a benchmark should do
 
