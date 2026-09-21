@@ -598,6 +598,17 @@ fn jump_clock_ahead_thread(should_exit: Arc<AtomicBool>) {
 
 use std::env;
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    // `--pitfall[=MICROSECONDS]`: demonstrate the scheduler-accounting pitfall
+    // on ~1 ms samples (or the given length) and exit.
+    if let Some(arg) = args.iter().find(|a| a.starts_with("--pitfall")) {
+        let micros: u64 = arg.strip_prefix("--pitfall=").map(|v| v.parse().expect("--pitfall=MICROSECONDS")).unwrap_or(1_000);
+        let iters = get_iters().min(20_000) as usize;
+        pitfall::run(micros * 1_000, iters);
+        return;
+    }
+
     let mut fns: Vec<fn()> = Vec::new();
     let mut clockmeasurementhandles = Vec::new();
 
@@ -639,8 +650,6 @@ fn main() {
     println!("{:>38} {:>21} {:>13} {:>7} {:>7} {:>11} {:>10} {:>17} {:>13} {:>10}", "fnname", "clock", "nsamples", "min", "perc50", "mean", "perc95", "max", "stddev", "drift");
     println!("{:>38} {:>21} {:>13} {:>7} {:>7} {:>11} {:>10} {:>17} {:>13} {:>10}", "------", "-----", "--------", "---", "------", "----", "------", "---", "------", "-----");
 
-    let args: Vec<String> = env::args().collect();
-
     let numthreadsperfunc = if args.contains(&"--overthread".to_string()) {
         let count = thread::available_parallelism().unwrap().get();
         assert!(count >= 1_usize);
@@ -677,4 +686,203 @@ fn main() {
         }
     }
 
+}
+
+// ── Scheduler-accounting pitfall ────────────────────────────────────────────
+//
+// CPU-time clocks (CLOCK_THREAD_CPUTIME_ID, CLOCK_PROCESS_CPUTIME_ID) are
+// scheduler accounting: the kernel bills time to a thread at context switches
+// and timer ticks, and interpolates within the running slice. A hardware
+// counter (CLOCK_UPTIME_RAW on Darwin, CLOCK_MONOTONIC on Linux) is a
+// register read. The two behave differently when the thread is interrupted
+// mid-measurement.
+//
+// This mode runs one fixed piece of work many times and reads BOTH clocks
+// around each run. For every sample it records wall nanoseconds, CPU
+// nanoseconds, and the ratio. A run of pure computation on one thread uses
+// CPU time at exactly the wall rate while it runs, so the honest outcomes are:
+//
+//   cpu ≈ wall            the thread ran uninterrupted;
+//   cpu < wall, by a lot  the thread was descheduled; wall counted the gap,
+//                         CPU time did not (the case that motivates CPU clocks).
+//
+// The pitfall is the third outcome: cpu < wall by a modest, repeated amount
+// on samples that show no sign of a deschedule (their wall time is at the
+// distribution's minimum). Those are slices the accounting billed short. In
+// a benchmark, such a sample reports the work running faster than the
+// hardware allows; a wall-clock sample can only run long, which a median
+// absorbs and a min–max band reports.
+//
+// The report groups samples by how far cpu falls below wall and shows the
+// distribution of the CPU-clock reading itself: its minimum against its
+// median tells whether the clock invented speed.
+
+pub mod pitfall {
+    use super::{black_box, Separable};
+    use std::time::Instant;
+
+    /// Deterministic work of about a millisecond: a hash-like integer loop
+    /// with a data dependency, so it cannot be hoisted or vectorised away
+    /// and its per-call cost is stable to well under a percent.
+    #[inline(never)]
+    fn work(rounds: u64) -> u64 {
+        let mut a: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut b: u64 = 0x1234_5678_9ABC_DEF0;
+        for i in 0..rounds {
+            a = a.rotate_left(13) ^ b.wrapping_add(i);
+            b = b.rotate_right(7).wrapping_mul(0x100_0000_01B3) ^ a;
+        }
+        black_box(a ^ b)
+    }
+
+    #[cfg(unix)]
+    fn thread_cpu_ns() -> u64 {
+        use super::plat_unixes::libc;
+        let mut tp = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut tp) };
+        assert_eq!(rc, 0);
+        tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64
+    }
+
+    #[cfg(not(unix))]
+    fn thread_cpu_ns() -> u64 {
+        panic!("the pitfall mode reads CLOCK_THREAD_CPUTIME_ID and runs on Unix only");
+    }
+
+    struct Sample {
+        wall_ns: u64,
+        cpu_ns: u64,
+    }
+
+    fn percentile(sorted: &[u64], p: usize) -> u64 {
+        sorted[(sorted.len() - 1) * p / 100]
+    }
+
+    pub fn run(target_ns: u64, iters: usize) {
+        // Calibrate the work to about target_ns of wall time.
+        let mut rounds: u64 = 1_000;
+        loop {
+            let t = Instant::now();
+            black_box(work(rounds));
+            let ns = t.elapsed().as_nanos() as u64;
+            if ns >= target_ns / 8 {
+                rounds = rounds * target_ns / ns.max(1);
+                break;
+            }
+            rounds *= 4;
+        }
+        for _ in 0..16 {
+            black_box(work(rounds));
+        }
+
+        // Competing threads: one busy loop per available core, so the
+        // measuring thread is preempted and migrated the way it would be on
+        // a machine doing other work. Without them the pitfall rarely fires.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let competitors: Vec<_> = (0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        x = black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+                    }
+                    x
+                })
+            })
+            .collect();
+
+        let mut samples: Vec<Sample> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let cpu0 = thread_cpu_ns();
+            let wall0 = Instant::now();
+            black_box(work(rounds));
+            let wall_ns = wall0.elapsed().as_nanos() as u64;
+            let cpu_ns = thread_cpu_ns() - cpu0;
+            samples.push(Sample { wall_ns, cpu_ns });
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for handle in competitors {
+            let _ = handle.join();
+        }
+
+        let mut wall: Vec<u64> = samples.iter().map(|s| s.wall_ns).collect();
+        let mut cpu: Vec<u64> = samples.iter().map(|s| s.cpu_ns).collect();
+        wall.sort_unstable();
+        cpu.sort_unstable();
+
+        let wall_min = wall[0];
+        let wall_med = percentile(&wall, 50);
+        let cpu_min = cpu[0];
+        let cpu_med = percentile(&cpu, 50);
+
+        println!();
+        println!("Scheduler-accounting pitfall: {} samples of ~{} µs of fixed work, wall (Instant) and CPU (CLOCK_THREAD_CPUTIME_ID) read around each,",
+            iters.separate_with_commas(), target_ns / 1_000);
+        println!("with one competing busy thread per core so the measuring thread is preempted and migrated as on a busy machine.");
+        println!();
+        println!("{:>22} {:>12} {:>12} {:>12} {:>12} {:>12}", "clock", "min", "perc50", "perc95", "max", "min/perc50");
+        println!("{:>22} {:>12} {:>12} {:>12} {:>12} {:>12}", "-----", "---", "------", "------", "---", "----------");
+        for (name, v) in [("wall (hardware ctr)", &wall), ("thread CPU time", &cpu)] {
+            let min = v[0];
+            let med = percentile(v, 50);
+            println!("{:>22} {:>12} {:>12} {:>12} {:>12} {:>11}%",
+                name,
+                min.separate_with_commas(),
+                med.separate_with_commas(),
+                percentile(v, 95).separate_with_commas(),
+                v[v.len() - 1].separate_with_commas(),
+                min * 100 / med);
+        }
+        println!();
+
+        // Classify each sample by cpu relative to its own wall reading.
+        let mut uninterrupted = 0usize;      // cpu within 1% of wall
+        let mut descheduled = 0usize;        // wall ≥ 1.5× wall_min: a real gap
+        let mut under_billed = 0usize;       // wall near its min, yet cpu < 0.97 wall
+        let mut cpu_over_wall = 0usize;      // impossible: cpu > wall by > 1%
+        let mut under_billed_ratio_permille: Vec<u64> = Vec::new();
+        for s in &samples {
+            let near_min_wall = s.wall_ns <= wall_min + wall_min / 20; // within 5% of the fastest run
+            if s.cpu_ns > s.wall_ns + s.wall_ns / 100 {
+                cpu_over_wall += 1;
+            } else if s.wall_ns >= wall_min + wall_min / 2 {
+                descheduled += 1;
+            } else if near_min_wall && s.cpu_ns * 100 < s.wall_ns * 97 {
+                under_billed += 1;
+                under_billed_ratio_permille.push(s.cpu_ns * 1000 / s.wall_ns);
+            } else {
+                uninterrupted += 1;
+            }
+        }
+        under_billed_ratio_permille.sort_unstable();
+
+        println!("Per-sample classification (cpu vs the same sample's wall reading):");
+        println!("  {:>7}  uninterrupted: cpu ≈ wall", uninterrupted.separate_with_commas());
+        println!("  {:>7}  descheduled: wall ≥ 1.5× its minimum; CPU time correctly omits the gap", descheduled.separate_with_commas());
+        println!("  {:>7}  UNDER-BILLED: wall within 5% of its minimum (no deschedule), yet cpu < 97% of wall", under_billed.separate_with_commas());
+        if !under_billed_ratio_permille.is_empty() {
+            let n = under_billed_ratio_permille.len();
+            println!("           cpu/wall on those: min {}‰, median {}‰, max {}‰",
+                under_billed_ratio_permille[0], under_billed_ratio_permille[n / 2], under_billed_ratio_permille[n - 1]);
+        }
+        println!("  {:>7}  cpu > wall by more than 1% (impossible for a single thread; indicates clock skew or bad interpolation)", cpu_over_wall.separate_with_commas());
+        println!();
+
+        let wall_floor_permille = wall_min * 1000 / wall_med;
+        let cpu_floor_permille = cpu_min * 1000 / cpu_med;
+        println!("Verdict for benchmarking:");
+        println!("  wall clock minimum is {}‰ of its median; thread CPU minimum is {}‰ of its median.",
+            wall_floor_permille, cpu_floor_permille);
+        if cpu_floor_permille + 20 < wall_floor_permille {
+            println!("  The CPU clock reports the fixed work finishing faster than the hardware counter ever saw it finish.");
+            println!("  Those samples are under-billed slices, not faster runs. A benchmark's minimum and min–max band");
+            println!("  built on this clock will show speed the machine did not deliver. Prefer the hardware counter.");
+        } else {
+            println!("  On this run the CPU clock's floor matches the hardware counter's; the pitfall did not appear here.");
+            println!("  It appears under load and on machines where the scheduler moves threads between cores; rerun");
+            println!("  with --overthread or alongside other work to provoke it.");
+        }
+    }
 }
